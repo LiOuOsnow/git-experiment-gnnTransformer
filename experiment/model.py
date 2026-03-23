@@ -1,23 +1,15 @@
 import dgl
-import numpy as np
 import torch
-from torch import nn
-import dgl.nn as dglnn
 import torch.nn as nn
 import dgl.function as fn
-import random
-import tqdm
-import sklearn.metrics
 from torch import cosine_similarity
 import torch.nn.functional as F
 from dgl.nn.functional import edge_softmax
 from dgl.utils import expand_as_pair
 from dgl.nn.pytorch.utils import Identity
-import dgl.function as fn
 import torch as th
-from torch import nn
 from utils import *
-from torch.nn import init
+
 
 
 class Edge_level(nn.Module):
@@ -170,6 +162,85 @@ class Semantic_level(nn.Module):
         return beta
 
 
+class SparseSelfAttention(nn.Module):
+    def __init__(self, d_model, num_heads, top_k=16, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.top_k = top_k  # Hyperparameter k in the diagram
+        self.head_dim = d_model // num_heads
+        
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
+        # Input Preparation: Q = W_Q * X, K = W_K * X, V = W_V * X
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, x):
+        # x corresponds to X_pos in the description
+        B, L, D = x.shape
+        
+        q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Calculate attention scores: P = Q * K^T / sqrt(d)
+        scores = (q @ k.transpose(-2, -1)) * self.scale
+        
+        # Sparse Attention Masking Operation M(.,.)
+        # Select top-k elements (Explicit Selection)
+        if self.top_k < L:
+            # 1. Find the k-th largest value t_i for each row i
+            # top_k_values contains the values of the top k elements
+            top_k_values, _ = torch.topk(scores, self.top_k, dim=-1)
+            
+            # 2. Threshold t is the smallest value among the top-k (the k-th value)
+            threshold = top_k_values[..., -1].unsqueeze(-1)
+            
+            # 3. Create mask M: 
+            # If P_ij >= t_i (part of top-k), keep it.
+            # If P_ij < t_i, set to -infinity.
+            mask = scores < threshold
+            scores = scores.masked_fill(mask, float('-inf'))
+            
+        # Normalization: A = softmax(M(P, k))
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        
+        # Node Feature Update: H = V * A (implemented as attn @ v)
+        out = (attn @ v).transpose(1, 2).reshape(B, L, D)
+        return self.out_proj(out)
+
+class SparseTransformerBlock(nn.Module):
+    def __init__(self, d_model, num_heads, top_k=16, dim_feedforward=512, dropout=0.1):
+        super().__init__()
+        self.self_attn = SparseSelfAttention(d_model, num_heads, top_k, dropout=dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+    def forward(self, src):
+        src2 = self.self_attn(src)
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
+
 class HeteroGraph(nn.Module):
     def __init__(self, mods, in_size_sem, num_head):
         super(HeteroGraph, self).__init__()
@@ -228,7 +299,7 @@ class HeteroGraph(nn.Module):
 
 
 class HMGNN(nn.Module):
-    def __init__(self, in_feats, hid_feats, out_feats, rel_names, num_heads):
+    def __init__(self, in_feats, hid_feats, out_feats, rel_names, num_heads, use_transformer=True, top_k=16):
         super().__init__()
         self.conv1 = HeteroGraph({
             rel: Edge_level(in_feats, hid_feats, num_heads=num_heads, )
@@ -236,6 +307,28 @@ class HMGNN(nn.Module):
         self.conv2 = HeteroGraph({
             rel: Edge_level(hid_feats * num_heads, out_feats, num_heads=num_heads, )
             for rel in rel_names}, in_size_sem=out_feats, num_head=num_heads)
+        
+        self.use_transformer = use_transformer
+        self.top_k = top_k
+        
+        if self.use_transformer:
+            # Sparse Transformer Encoder
+            self.transformer_dim = out_feats * num_heads 
+            self.sparse_transformer = SparseTransformerBlock(
+                d_model=self.transformer_dim, 
+                num_heads=num_heads, 
+                top_k=top_k,    # Pass top_k parameter
+                dropout=0.2      # 增加 dropout 防止过拟合
+            )
+            
+            # 门控融合机制 - 让模型自己决定何时使用 Transformer
+            self.gate_network = nn.Sequential(
+                nn.Linear(self.transformer_dim * 2, self.transformer_dim),
+                nn.ReLU(),
+                nn.Linear(self.transformer_dim, 1),
+                nn.Sigmoid()
+            )
+
         self.lin = nn.Linear(out_feats * num_heads, out_feats)
         self.lin2 = nn.Linear(out_feats, out_feats)
         self.relu = nn.ReLU()
@@ -247,16 +340,50 @@ class HMGNN(nn.Module):
         h = self.conv2(graph, h, edge_attr)
         h = {k: v.reshape(v.shape[0], -1) for k, v in h.items()}
         h = {k: F.relu(v) for k, v in h.items()}
-        h = {k: self.lin(v) for k, v in h.items()}
-        h = {k: self.lin2(v) for k, v in h.items()}
-        return h
+        
+        if self.use_transformer:
+            h_fused = {}
+            
+            # 只对 user 节点应用 Transformer
+            if 'user' in h:
+                h_gnn = h['user']  # [num_users, dim]
+                num_users = h_gnn.shape[0]
+                
+                # 去除位置编码
+                feat_with_pe = h_gnn
+                
+                # 通过 Transformer
+                feat_with_pe = feat_with_pe.unsqueeze(0)  # [1, num_users, dim]
+                h_transformer = self.sparse_transformer(feat_with_pe)
+                h_transformer = h_transformer.squeeze(0)  # [num_users, dim]
+                
+                # 门控融合: gate 决定每个节点使用多少 Transformer 信息
+                # 拼接 GNN 和 Transformer 特征
+                combined = torch.cat([h_gnn, h_transformer], dim=-1)  # [num_users, 2*dim]
+                gate = self.gate_network(combined)  # [num_users, 1]
+                
+                # 门控融合: h = gate * h_transformer + (1 - gate) * h_gnn
+                # 对于大多数节点，gate 会接近 0（主要用 GNN）
+                # 只有需要全局信息的节点，gate 才会变大
+                h_fused['user'] = gate * h_transformer + (1 - gate) * h_gnn
+            
+            # poi 节点直接使用 GNN 输出
+            if 'poi' in h:
+                h_fused['poi'] = h['poi']
+        else:
+            h_fused = h
+        
+        # 最终的线性投影
+        h_fused = {k: self.lin(v) for k, v in h_fused.items()}
+        h_fused = {k: self.lin2(v) for k, v in h_fused.items()}
+        return h_fused
 
 
 class Model(nn.Module):
-    def __init__(self, in_features, hidden_features, out_features, rel_names, num_heads):
+    def __init__(self, in_features, hidden_features, out_features, rel_names, num_heads, use_transformer=True, top_k=16):
         super().__init__()
         self.rel_names = rel_names
-        self.sage = HMGNN(in_features, hidden_features, out_features, rel_names, num_heads)
+        self.sage = HMGNN(in_features, hidden_features, out_features, rel_names, num_heads, use_transformer=use_transformer, top_k=top_k)
         self.pred = HeteroDotProductPredictor()
         self.lin = nn.Linear(out_features, out_features)
         self.relu = nn.ReLU()
@@ -287,4 +414,3 @@ class Model(nn.Module):
             i += 1
         h = self.sage(g, feat2, edge_attr_new)
         return self.pred(g, h, etype), self.pred(neg_g, h, etype), h, contrastive_loss(h['user'], g)
-

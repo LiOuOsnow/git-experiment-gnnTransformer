@@ -125,37 +125,23 @@ def test(user_emb,g,friend_list_index_test):
     test_preds = []
     for i in range(len(test_src)):
         test_preds.append((F.cosine_similarity(user_emb[test_src[i]], user_emb[test_dst[i]], dim=0)))
-    y_true_np = test_labels.detach().cpu().numpy()
-    y_score_tensor = torch.tensor(test_preds)
-    y_score_np = y_score_tensor.detach().cpu().numpy()
-
-    auc = sklearn.metrics.roc_auc_score(y_true_np, y_score_tensor)
-    ap = sklearn.metrics.average_precision_score(y_true_np, y_score_tensor)
+    auc = sklearn.metrics.roc_auc_score(test_labels.detach().numpy(), torch.tensor(test_preds))
+    ap = sklearn.metrics.average_precision_score(test_labels.detach().numpy(), torch.tensor(test_preds))
     
-    # F1 Score with Fixed Threshold (0.5)
-    y_pred_fixed = (y_score_np >= 0.5).astype(int)
-    f1_fixed = sklearn.metrics.f1_score(y_true_np, y_pred_fixed)
+    # Calculate F1 score
+    test_labels_np = test_labels.detach().numpy()
+    test_preds_tensor = torch.tensor(test_preds)
     
-    # F1 Score with Best Threshold
-    precisions, recalls, thresholds = sklearn.metrics.precision_recall_curve(y_true_np, y_score_np)
-    # Calculate F1 for each threshold
-    # Note: precision and recall have one more element than thresholds
-    f1_scores = 2 * recalls * precisions / (recalls + precisions + 1e-10)
-    # Remove the last element of f1_scores as it corresponds to precision=1, recall=0 which is not associated with a threshold
-    f1_scores = f1_scores[:-1] 
-    
-    if len(f1_scores) > 0:
-        best_f1_idx = np.argmax(f1_scores)
-        best_f1 = f1_scores[best_f1_idx]
-        best_thresh = thresholds[best_f1_idx]
-    else:
-        best_f1 = 0.0
-        best_thresh = 0.0
+    # 2. Best Threshold F1 (Dynamic Search)
+    precision, recall, thresholds = sklearn.metrics.precision_recall_curve(test_labels_np, test_preds_tensor)
+    f1_scores = 2 * recall * precision / (recall + precision + 1e-10)
+    best_f1_index = np.argmax(f1_scores)
+    best_f1 = f1_scores[best_f1_index]
+    best_threshold = thresholds[best_f1_index] if best_f1_index < len(thresholds) else 0.5
 
     print('Link Prediction AUC:', auc)
     print("average_precision AP:", ap)
-    print(f"F1 (Fixed 0.5): {f1_fixed:.4f}")
-    print(f"Best F1: {best_f1:.4f} at Threshold: {best_thresh:.4f}")
+    print(f"Best F1 Score: {best_f1:.4f} (at threshold {best_threshold:.4f})")
 
     #Top-k
     user_emb_norm = torch.norm(user_emb, dim=-1, keepdim=True)
@@ -261,5 +247,4 @@ def test(user_emb,g,friend_list_index_test):
     #         right+=1
     # print("Top ",k,'accuracy score is:', right/len(y_true))
 
-    return auc, ap, top_k, f1_fixed, best_f1
-
+    return auc, ap, best_f1, top_k
